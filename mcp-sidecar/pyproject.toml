@@ -1,0 +1,41 @@
+# WeKnora MCP 侧车 —— Python 工程定义
+# 定位见 README.md 与 指南/变更文档/MCP/需求.md
+[project]
+name = "weknora-mcp-sidecar"
+version = "0.1.0"
+description = "WeKnora 通用只读 MCP 侧车：单 Bearer 兼容机器/用户两类客户端，内部仅走 WeKnora REST"
+requires-python = ">=3.10"
+dependencies = [
+    # 官方 Python MCP SDK（2.0 起 FastMCP 更名 MCPServer），提供 Streamable HTTP 传输
+    "mcp>=2.3,<3",
+    # 调用 WeKnora REST（SDK 也自带 httpx，这里显式声明以便侧车直接使用）
+    "httpx>=0.27",
+    # 只读直连 mcp_endpoints / mcp_user_permission 两张表
+    "asyncpg>=0.29",
+    # Redis 滑窗限流（复用现有 Redis 实例）
+    "redis>=5.0",
+    # 校验千机网关签发的 HS256 用户票据
+    "PyJWT>=2.8",
+    # ASGI 承载
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+# 本地开发/测试：uv sync 自动安装；镜像内不安装
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    # 模拟 WeKnora REST，做 9 工具契约测试
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,19 @@
+{
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": {
+        "content": [
+            {
+                "text": "ceshi2 知识库里目前有 **2 份 PDF 文档**，主题完全不同：\n\n1. **《中国保监会关于促进团体保险健康发展有关问题的通知》**（保监发〔2015〕14号，2015年发布）\n   —— 一份保险监管文件，明确团体保险的定义、特定团体范围、条款费率审批备案、保险凭证签发、跨区域承保机构等管理要求。\n\n2. **《华兴OA系统智能化交流材料》**（2025年2月）\n   —— 华兴银行基于企业微信的智慧办公平台 AI 升级方案，针对查询分散、沟通繁杂、审批低效等痛点，提出智能查询、AI 助理、文档处理、部署硬件配置等智能化改造内容。\n\n简单说：一份是**团体保险监管政策**，一份是**银行 OA 系统的 AI 智能化方案**。\n\nsession_id: t1.eyJzaWQiOiJlY2JlNDAwMC0xNTkxLTRkYjQtYTgzNy0xZTE4YWIyZGJlNDQiLCJlcCI6IjQxNzNiODFjLWM3NjctNGE3Zi04OWExLWRlNjRjMDBmMmJhOCIsInVpZCI6InNtb2tlLXVzZXItMSJ9.WZoTZanE_3tZ9aXZRfzhY5TjBxIMitpi2iPf9gpjDYk",
+                "type": "text"
+            }
+        ],
+        "isError": false,
+        "structuredContent": {
+            "answer": "ceshi2 知识库里目前有 **2 份 PDF 文档**，主题完全不同：\n\n1. **《中国保监会关于促进团体保险健康发展有关问题的通知》**（保监发〔2015〕14号，2015年发布）\n   —— 一份保险监管文件，明确团体保险的定义、特定团体范围、条款费率审批备案、保险凭证签发、跨区域承保机构等管理要求。\n\n2. **《华兴OA系统智能化交流材料》**（2025年2月）\n   —— 华兴银行基于企业微信的智慧办公平台 AI 升级方案，针对查询分散、沟通繁杂、审批低效等痛点，提出智能查询、AI 助理、文档处理、部署硬件配置等智能化改造内容。\n\n简单说：一份是**团体保险监管政策**，一份是**银行 OA 系统的 AI 智能化方案**。",
+            "session_id": "t1.eyJzaWQiOiJlY2JlNDAwMC0xNTkxLTRkYjQtYTgzNy0xZTE4YWIyZGJlNDQiLCJlcCI6IjQxNzNiODFjLWM3NjctNGE3Zi04OWExLWRlNjRjMDBmMmJhOCIsInVpZCI6InNtb2tlLXVzZXItMSJ9.WZoTZanE_3tZ9aXZRfzhY5TjBxIMitpi2iPf9gpjDYk",
+            "agent_id": "aa8e24ef-98f1-48a9-89dc-4c0a101fec40",
+            "references": []
+        }
+    }
+}

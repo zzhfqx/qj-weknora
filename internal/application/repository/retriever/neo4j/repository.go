@@ -1,0 +1,967 @@
+package neo4j
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/neo4j/neo4j-go-driver/v6/neo4j"
+)
+
+// Neo4jRepository is a repository for Neo4j
+type Neo4jRepository struct {
+	driver     neo4j.Driver
+	nodePrefix string
+}
+
+// NewNeo4jRepository creates a new Neo4j repository
+func NewNeo4jRepository(driver neo4j.Driver) interfaces.RetrieveGraphRepository {
+	return &Neo4jRepository{driver: driver, nodePrefix: "ENTITY"}
+}
+
+// _remove_hyphen removes hyphens from a string
+func _remove_hyphen(s string) string {
+	return strings.ReplaceAll(s, "-", "_")
+}
+
+// Labels returns the labels for a namespace
+func (n *Neo4jRepository) Labels(namespace types.NameSpace) []string {
+	res := make([]string, 0)
+	for _, label := range namespace.Labels() {
+		res = append(res, n.nodePrefix+_remove_hyphen(label))
+	}
+	return res
+}
+
+// Label returns the label for a namespace
+func (n *Neo4jRepository) Label(namespace types.NameSpace) string {
+	labels := n.Labels(namespace)
+	return strings.Join(labels, ":")
+}
+
+// AddGraph adds a graph to the Neo4j repository
+func (n *Neo4jRepository) AddGraph(ctx context.Context, namespace types.NameSpace, graphs []*types.GraphData) error {
+	if n.driver == nil {
+		logger.Warnf(ctx, "NOT SUPPORT RETRIEVE GRAPH")
+		return nil
+	}
+	for _, graph := range graphs {
+		if err := n.addGraph(ctx, namespace, graph); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addGraph adds a graph to the Neo4j repository
+func (n *Neo4jRepository) addGraph(ctx context.Context, namespace types.NameSpace, graph *types.GraphData) error {
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		// Node import query
+		// 核心改动：apoc.merge.node 只用知识库级标签 + name 作为匹配键
+		// 同一知识库下同名实体直接合并，chunks 和 attributes 合并去重
+		// （原逻辑用所有标签 + name + kg 匹配，导致不同 knowledge 的同名实体创建重复节点）
+		kbLabel := n.nodePrefix + _remove_hyphen(namespace.KnowledgeBase)
+		node_import_query := `
+			UNWIND $data AS row
+			CALL apoc.merge.node(row.labels, {name: row.name},
+				{attributes: row.attributes, chunks: row.chunks, kg: row.knowledge_id},
+				{}
+			) YIELD node
+			SET node.attributes = apoc.coll.union(coalesce(node.attributes, []), coalesce(row.attributes, []))
+			SET node.chunks = apoc.coll.union(coalesce(node.chunks, []), coalesce(row.chunks, []))
+			SET node.kg = row.knowledge_id
+			RETURN distinct 'done' AS result
+		`
+		nodeData := []map[string]interface{}{}
+		for _, node := range graph.Node {
+			nodeData = append(nodeData, map[string]interface{}{
+				"name":         node.Name,
+				"knowledge_id": namespace.Knowledge,
+				"attributes":   node.Attributes,
+				"chunks":       node.Chunks,
+				"labels":       []string{kbLabel},
+			})
+		}
+		if _, err := tx.Run(ctx, node_import_query, map[string]interface{}{"data": nodeData}); err != nil {
+			return nil, fmt.Errorf("failed to create nodes: %v", err)
+		}
+
+		// Relationship import query
+		// 关系两端的节点也用同样的合并策略（同名合并），避免创建重名空壳节点
+		rel_import_query := `
+			UNWIND $data AS row
+			CALL apoc.merge.node(row.labels, {name: row.source}, {kg: row.knowledge_id}, {}) YIELD node as source
+			CALL apoc.merge.node(row.labels, {name: row.target}, {kg: row.knowledge_id}, {}) YIELD node as target
+			CALL apoc.merge.relationship(source, row.type, {}, {}, target) YIELD rel
+			RETURN distinct 'done'
+		`
+		relData := []map[string]interface{}{}
+		for _, rel := range graph.Relation {
+			relData = append(relData, map[string]interface{}{
+				"source":       rel.Node1,
+				"target":       rel.Node2,
+				"knowledge_id": namespace.Knowledge,
+				"type":         rel.Type,
+				"labels":       []string{kbLabel},
+			})
+		}
+		if _, err := tx.Run(ctx, rel_import_query, map[string]interface{}{"data": relData}); err != nil {
+			return nil, fmt.Errorf("failed to create relationships: %v", err)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "failed to add graph: %v", err)
+		return err
+	}
+	return nil
+}
+
+// DelGraph deletes a graph from the Neo4j repository
+func (n *Neo4jRepository) DelGraph(ctx context.Context, namespaces []types.NameSpace) error {
+	if n.driver == nil {
+		logger.Warnf(ctx, "NOT SUPPORT RETRIEVE GRAPH")
+		return nil
+	}
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		for _, namespace := range namespaces {
+			labelExpr := n.Label(namespace)
+
+			deleteRelsQuery := `
+				CALL apoc.periodic.iterate(
+					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id})-[r]-(m:` + labelExpr + ` {kg: $knowledge_id}) RETURN r",
+					"DELETE r",
+					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
+				) YIELD batches, total
+				RETURN total
+        	`
+			if _, err := tx.Run(ctx, deleteRelsQuery, map[string]interface{}{"knowledge_id": namespace.Knowledge}); err != nil {
+				return nil, fmt.Errorf("failed to delete relationships: %v", err)
+			}
+
+			deleteNodesQuery := `
+				CALL apoc.periodic.iterate(
+					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id}) RETURN n",
+					"DELETE n",
+					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
+				) YIELD batches, total
+				RETURN total
+        	`
+			if _, err := tx.Run(ctx, deleteNodesQuery, map[string]interface{}{"knowledge_id": namespace.Knowledge}); err != nil {
+				return nil, fmt.Errorf("failed to delete nodes: %v", err)
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		return err
+	}
+	logger.Infof(ctx, "delete graph result: %v", result)
+	return nil
+}
+
+// SearchNode searches for nodes in the Neo4j repository
+func (n *Neo4jRepository) SearchNode(
+	ctx context.Context,
+	namespace types.NameSpace,
+	nodes []string,
+) (*types.GraphData, error) {
+	if n.driver == nil {
+		logger.Warnf(ctx, "NOT SUPPORT RETRIEVE GRAPH")
+		return nil, nil
+	}
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		labelExpr := n.Label(namespace)
+		query := `
+			MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
+			WHERE ANY(nodeText IN $nodes WHERE n.name CONTAINS nodeText)
+			RETURN n, r, m
+		`
+		params := map[string]interface{}{"nodes": nodes}
+		result, err := tx.Run(ctx, query, params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run query: %v", err)
+		}
+
+		graphData := &types.GraphData{}
+		nodeSeen := make(map[string]bool)
+		for result.Next(ctx) {
+			record := result.Record()
+			node, _ := record.Get("n")
+			rel, _ := record.Get("r")
+			targetNode, _ := record.Get("m")
+
+			nodeData := node.(neo4j.Node)
+			targetNodeData := targetNode.(neo4j.Node)
+
+			// Convert node to types.Node
+			for _, n := range []neo4j.Node{nodeData, targetNodeData} {
+				nameStr := n.Props["name"].(string)
+				if _, ok := nodeSeen[nameStr]; !ok {
+					nodeSeen[nameStr] = true
+					graphData.Node = append(graphData.Node, &types.GraphNode{
+						Name:       nameStr,
+						Chunks:     listI2listS(n.Props["chunks"].([]interface{})),
+						Attributes: listI2listS(n.Props["attributes"].([]interface{})),
+					})
+				}
+			}
+
+			// Convert relationship to types.Relation
+			relData := rel.(neo4j.Relationship)
+			graphData.Relation = append(graphData.Relation, &types.GraphRelation{
+				Node1: nodeData.Props["name"].(string),
+				Node2: targetNodeData.Props["name"].(string),
+				Type:  relData.Type,
+			})
+		}
+		return graphData, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "search node failed: %v", err)
+		return nil, err
+	}
+	return result.(*types.GraphData), nil
+}
+
+func listI2listS(list []any) []string {
+	result := make([]string, len(list))
+	for i, v := range list {
+		result[i] = fmt.Sprintf("%v", v)
+	}
+	return result
+}
+
+// kbLabel returns the knowledge-base-level label for querying
+func (n *Neo4jRepository) kbLabel(kbID string) string {
+	return n.nodePrefix + _remove_hyphen(kbID)
+}
+
+// safeProps extracts string-slice props safely from a node
+func safeStringList(props map[string]interface{}, key string) []string {
+	v, ok := props[key]
+	if !ok || v == nil {
+		return []string{}
+	}
+	if list, ok := v.([]interface{}); ok {
+		return listI2listS(list)
+	}
+	return []string{}
+}
+
+// ===== 可视化查询方法 =====
+
+// GetGraphOverview 获取图谱概览（按度数取 top-N 节点及其之间的关系）
+func (n *Neo4jRepository) GetGraphOverview(
+	ctx context.Context,
+	kbID string,
+	limit int,
+	relTypes []string,
+) (*types.Neo4jGraphData, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	label := n.kbLabel(kbID)
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		// Step 1: get total stats
+		var totalNodes, totalRels int
+		statsResult, err := tx.Run(ctx, `
+			MATCH (n:`+label+`) RETURN count(n) AS cnt
+		`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count nodes: %v", err)
+		}
+		if statsResult.Next(ctx) {
+			if cnt, ok := statsResult.Record().Get("cnt"); ok {
+				totalNodes = int(cnt.(int64))
+			}
+		}
+
+		statsResult2, err := tx.Run(ctx, `
+			MATCH (n:`+label+`)-[r]->(m:`+label+`) RETURN count(r) AS cnt
+		`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count rels: %v", err)
+		}
+		if statsResult2.Next(ctx) {
+			if cnt, ok := statsResult2.Record().Get("cnt"); ok {
+				totalRels = int(cnt.(int64))
+			}
+		}
+
+		// Step 2: Top-N nodes by degree
+		// Step 3: edges between those nodes (optionally filtered by relTypes)
+		relFilter := ""
+		params := map[string]interface{}{"limit": limit}
+		if len(relTypes) > 0 {
+			relFilter = " AND type(r) IN $rel_types"
+			params["rel_types"] = relTypes
+		}
+
+		query := `
+			MATCH (n:` + label + `)
+			OPTIONAL MATCH (n)-[r]-(:` + label + `)
+			WITH n, count(DISTINCT r) AS degree
+			ORDER BY degree DESC
+			LIMIT $limit
+			WITH collect({name: n.name, attributes: coalesce(n.attributes, []), degree: degree, chunk_count: size(coalesce(n.chunks, []))}) AS topNodes
+
+			UNWIND topNodes AS tn
+			WITH topNodes, tn.name AS tname
+			OPTIONAL MATCH (src:` + label + `{name: tname})-[r]->(dst:` + label + `)
+			WHERE dst.name IN [x IN topNodes | x.name]` + relFilter + `
+			WITH topNodes, collect(DISTINCT {source: src.name, target: dst.name, type: type(r)}) AS relations
+			RETURN topNodes, relations
+		`
+
+		graphResult, err := tx.Run(ctx, query, params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to run overview query: %v", err)
+		}
+
+		nodes := []types.Neo4jGraphNode{}
+		relations := []types.Neo4jGraphRelation{}
+		returned := 0
+		truncated := false
+
+		if graphResult.Next(ctx) {
+			record := graphResult.Record()
+			if topNodesVal, ok := record.Get("topNodes"); ok {
+				if topNodesList, ok := topNodesVal.([]interface{}); ok {
+					for _, item := range topNodesList {
+						if m, ok := item.(map[string]interface{}); ok {
+							node := types.Neo4jGraphNode{
+								Name:       fmt.Sprintf("%v", m["name"]),
+								Attributes: safeStringList(m, "attributes"),
+								Degree:     int(m["degree"].(int64)),
+								ChunkCount: int(m["chunk_count"].(int64)),
+							}
+							nodes = append(nodes, node)
+						}
+					}
+					returned = len(nodes)
+					truncated = returned < totalNodes
+				}
+			}
+			if relsVal, ok := record.Get("relations"); ok {
+				if relsList, ok := relsVal.([]interface{}); ok {
+					for _, item := range relsList {
+						if m, ok := item.(map[string]interface{}); ok {
+							relations = append(relations, types.Neo4jGraphRelation{
+								Source: fmt.Sprintf("%v", m["source"]),
+								Target: fmt.Sprintf("%v", m["target"]),
+								Type:   fmt.Sprintf("%v", m["type"]),
+							})
+						}
+					}
+				}
+			}
+		}
+
+		return &types.Neo4jGraphData{
+			Nodes:     nodes,
+			Relations: relations,
+			Meta: types.Neo4jGraphMeta{
+				Mode:       "overview",
+				TotalNodes: totalNodes,
+				TotalRels:  totalRels,
+				Returned:   returned,
+				Truncated:  truncated,
+			},
+		}, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "get graph overview failed: %v", err)
+		return nil, err
+	}
+	return result.(*types.Neo4jGraphData), nil
+}
+
+// GetEgoGraph 获取以实体为中心的 ego 图
+func (n *Neo4jRepository) GetEgoGraph(
+	ctx context.Context,
+	kbID string,
+	centerNode string,
+	depth int,
+	limit int,
+	relTypes []string,
+) (*types.Neo4jGraphData, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	label := n.kbLabel(kbID)
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		// Get total stats (reuse overview approach)
+		var totalNodes, totalRels int
+		statsResult, err := tx.Run(ctx, `MATCH (n:`+label+`) RETURN count(n) AS cnt`, nil)
+		if err == nil && statsResult.Next(ctx) {
+			if cnt, ok := statsResult.Record().Get("cnt"); ok {
+				totalNodes = int(cnt.(int64))
+			}
+		}
+		statsResult2, err := tx.Run(ctx, `MATCH (n:`+label+`)-[r]->(m:`+label+`) RETURN count(r) AS cnt`, nil)
+		if err == nil && statsResult2.Next(ctx) {
+			if cnt, ok := statsResult2.Record().Get("cnt"); ok {
+				totalRels = int(cnt.(int64))
+			}
+		}
+
+		// Build relationship filter for apoc.path.subgraphAll
+		relFilter := ""
+		if len(relTypes) > 0 {
+			// apoc relationshipFilter format: +TYPE1|+TYPE2 (include only these)
+			parts := make([]string, len(relTypes))
+			for i, rt := range relTypes {
+				parts[i] = "+" + rt
+			}
+			relFilter = strings.Join(parts, "|")
+		}
+
+		// Use apoc.path.subgraphAll with label filter and optional rel filter
+		apocConfig := map[string]interface{}{
+			"maxLevel":    depth,
+			"labelFilter": "+" + label,
+		}
+		if relFilter != "" {
+			apocConfig["relationshipFilter"] = relFilter
+		}
+
+		query := `
+			MATCH (center:` + label + `{name: $center})
+			CALL apoc.path.subgraphAll(center, $config) YIELD nodes, relationships
+			WITH nodes, relationships
+			UNWIND nodes AS nd
+			WITH nodes, relationships, nd
+			OPTIONAL MATCH (nd)-[r]-(:` + label + `)
+			WITH nodes, relationships, nd, count(DISTINCT r) AS deg
+			WITH nodes, relationships, collect({node: nd, degree: deg}) AS nodeDegrees
+			RETURN nodes, relationships, nodeDegrees
+		`
+		params := map[string]interface{}{
+			"center": centerNode,
+			"config": apocConfig,
+		}
+
+		graphResult, err := tx.Run(ctx, query, params)
+		if err != nil {
+			// Fallback: variable-length path query if apoc unavailable
+			logger.Warnf(ctx, "apoc.path.subgraphAll failed, falling back to variable-length path: %v", err)
+			return n.egoGraphFallback(ctx, tx, label, centerNode, depth, limit, relTypes, totalNodes, totalRels)
+		}
+
+		if !graphResult.Next(ctx) {
+			// Center node not found
+			return &types.Neo4jGraphData{
+				Nodes:     []types.Neo4jGraphNode{},
+				Relations: []types.Neo4jGraphRelation{},
+				Meta: types.Neo4jGraphMeta{
+					Mode:       "ego",
+					TotalNodes: totalNodes,
+					TotalRels:  totalRels,
+					Returned:   0,
+					Truncated:  false,
+					CenterNode: centerNode,
+					Depth:      depth,
+				},
+			}, nil
+		}
+
+		record := graphResult.Record()
+		nodes := []types.Neo4jGraphNode{}
+		relations := []types.Neo4jGraphRelation{}
+
+		if nodesVal, ok := record.Get("nodes"); ok {
+			if nodeList, ok := nodesVal.([]interface{}); ok {
+				// Build degree map from nodeDegrees
+				degreeMap := make(map[string]int)
+				if ndVal, ok := record.Get("nodeDegrees"); ok {
+					if ndList, ok := ndVal.([]interface{}); ok {
+						for _, item := range ndList {
+							if m, ok := item.(map[string]interface{}); ok {
+								if node, ok := m["node"].(neo4j.Node); ok {
+									name := fmt.Sprintf("%v", node.Props["name"])
+									if deg, ok := m["degree"].(int64); ok {
+										degreeMap[name] = int(deg)
+									}
+								}
+							}
+						}
+					}
+				}
+
+				// limit <= 0 表示不截断，返回全部节点
+				truncated := limit > 0 && len(nodeList) > limit
+				count := len(nodeList)
+				if truncated {
+					count = limit
+				}
+
+				// Build node set and collect nodes (up to limit)
+				nodeSet := make(map[string]bool)
+				for i := 0; i < count; i++ {
+					if node, ok := nodeList[i].(neo4j.Node); ok {
+						name := fmt.Sprintf("%v", node.Props["name"])
+						nodeSet[name] = true
+						nodes = append(nodes, types.Neo4jGraphNode{
+							Name:       name,
+							Attributes: safeStringList(node.Props, "attributes"),
+							Degree:     degreeMap[name],
+							ChunkCount: len(safeStringList(node.Props, "chunks")),
+						})
+					}
+				}
+
+				// Build elementId -> name map from all returned nodes
+				idToName := make(map[string]string)
+				for _, nodeItem := range nodeList {
+					if node, ok := nodeItem.(neo4j.Node); ok {
+						idToName[node.ElementId] = fmt.Sprintf("%v", node.Props["name"])
+					}
+				}
+
+				// Build adjacency from full subgraph relations for BFS depth calculation
+				allAdj := make(map[string][]string)
+				if relsVal, ok := record.Get("relationships"); ok {
+					if relList, ok := relsVal.([]interface{}); ok {
+						for _, r := range relList {
+							if rel, ok := r.(neo4j.Relationship); ok {
+								srcName := idToName[rel.StartElementId]
+								dstName := idToName[rel.EndElementId]
+								if srcName != "" && dstName != "" {
+									allAdj[srcName] = append(allAdj[srcName], dstName)
+									allAdj[dstName] = append(allAdj[dstName], srcName)
+								}
+							}
+						}
+					}
+				}
+
+				// BFS from center to compute shortest-hop depth for each node
+				depthMap := make(map[string]int)
+				bfsQueue := []string{centerNode}
+				depthMap[centerNode] = 0
+				for len(bfsQueue) > 0 {
+					cur := bfsQueue[0]
+					bfsQueue = bfsQueue[1:]
+					curDepth := depthMap[cur]
+					if curDepth >= depth {
+						continue
+					}
+					for _, neighbor := range allAdj[cur] {
+						if _, visited := depthMap[neighbor]; !visited {
+							depthMap[neighbor] = curDepth + 1
+							bfsQueue = append(bfsQueue, neighbor)
+						}
+					}
+				}
+
+				// Process relationships: keep only edges connecting adjacent BFS layers (depth diff == 1)
+				// This gives a "path tree" — no horizontal edges between same-hop nodes,
+				// only edges that lie on shortest paths from the center.
+				fixedRels := []types.Neo4jGraphRelation{}
+				if relsVal, ok := record.Get("relationships"); ok {
+					if relList, ok := relsVal.([]interface{}); ok {
+						for _, r := range relList {
+							if rel, ok := r.(neo4j.Relationship); ok {
+								srcName := idToName[rel.StartElementId]
+								dstName := idToName[rel.EndElementId]
+								if srcName != "" && dstName != "" && nodeSet[srcName] && nodeSet[dstName] {
+									d1, ok1 := depthMap[srcName]
+									d2, ok2 := depthMap[dstName]
+									if ok1 && ok2 {
+										diff := d1 - d2
+										if diff < 0 {
+											diff = -diff
+										}
+										if diff == 1 {
+											fixedRels = append(fixedRels, types.Neo4jGraphRelation{
+												Source: srcName,
+												Target: dstName,
+												Type:   rel.Type,
+											})
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+				return &types.Neo4jGraphData{
+					Nodes:     nodes,
+					Relations: fixedRels,
+					Meta: types.Neo4jGraphMeta{
+						Mode:       "ego",
+						TotalNodes: totalNodes,
+						TotalRels:  totalRels,
+						Returned:   len(nodes),
+						Truncated:  truncated,
+						CenterNode: centerNode,
+						Depth:      depth,
+					},
+				}, nil
+			}
+		}
+
+		return &types.Neo4jGraphData{
+			Nodes:     nodes,
+			Relations: relations,
+			Meta: types.Neo4jGraphMeta{
+				Mode:       "ego",
+				TotalNodes: totalNodes,
+				TotalRels:  totalRels,
+				Returned:   0,
+				Truncated:  false,
+				CenterNode: centerNode,
+				Depth:      depth,
+			},
+		}, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "get ego graph failed: %v", err)
+		return nil, err
+	}
+	return result.(*types.Neo4jGraphData), nil
+}
+
+// egoGraphFallback uses variable-length path queries when apoc is unavailable
+func (n *Neo4jRepository) egoGraphFallback(
+	ctx context.Context,
+	tx neo4j.ManagedTransaction,
+	label string,
+	centerNode string,
+	depth int,
+	limit int,
+	relTypes []string,
+	totalNodes int,
+	totalRels int,
+) (*types.Neo4jGraphData, error) {
+	params := map[string]interface{}{"center": centerNode}
+	if limit > 0 {
+		params["limit"] = limit
+	}
+
+	// Use variable-length paths
+	limitClause := ""
+	if limit > 0 {
+		limitClause = "LIMIT $limit"
+	}
+	query := `
+		MATCH path = (center:` + label + `{name: $center})-[*1..` + fmt.Sprintf("%d", depth) + `]-(n:` + label + `)
+		UNWIND nodes(path) AS nd
+		UNWIND relationships(path) AS rel
+		WITH collect(DISTINCT nd) AS uniqueNodes, collect(DISTINCT rel) AS uniqueRels
+		` + limitClause + `
+		RETURN uniqueNodes, uniqueRels
+	`
+	// Note: for fallback mode, relation type filtering is not applied
+	_ = relTypes // silence unused
+
+	result, err := tx.Run(ctx, query, params)
+	if err != nil {
+		return nil, fmt.Errorf("fallback ego query failed: %v", err)
+	}
+
+	nodes := []types.Neo4jGraphNode{}
+	relations := []types.Neo4jGraphRelation{}
+
+	if result.Next(ctx) {
+		record := result.Record()
+		if nodesVal, ok := record.Get("uniqueNodes"); ok {
+			if nodeList, ok := nodesVal.([]interface{}); ok {
+				idToName := make(map[string]string)
+				for _, ni := range nodeList {
+					if node, ok := ni.(neo4j.Node); ok {
+						name := fmt.Sprintf("%v", node.Props["name"])
+						idToName[node.ElementId] = name
+						nodes = append(nodes, types.Neo4jGraphNode{
+							Name:       name,
+							Attributes: safeStringList(node.Props, "attributes"),
+							Degree:     0,
+							ChunkCount: len(safeStringList(node.Props, "chunks")),
+						})
+					}
+				}
+				if relsVal, ok := record.Get("uniqueRels"); ok {
+					if relList, ok := relsVal.([]interface{}); ok {
+						for _, ri := range relList {
+							if rel, ok := ri.(neo4j.Relationship); ok {
+								srcName := idToName[rel.StartElementId]
+								dstName := idToName[rel.EndElementId]
+								if srcName != "" && dstName != "" {
+									relations = append(relations, types.Neo4jGraphRelation{
+										Source: srcName,
+										Target: dstName,
+										Type:   rel.Type,
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return &types.Neo4jGraphData{
+		Nodes:     nodes,
+		Relations: relations,
+		Meta: types.Neo4jGraphMeta{
+			Mode:       "ego",
+			TotalNodes: totalNodes,
+			TotalRels:  totalRels,
+			Returned:   len(nodes),
+			Truncated:  limit > 0 && len(nodes) >= limit,
+			CenterNode: centerNode,
+			Depth:      depth,
+		},
+	}, nil
+}
+
+// SearchNodes 按名称模糊搜索实体节点
+func (n *Neo4jRepository) SearchNodes(
+	ctx context.Context,
+	kbID string,
+	query string,
+	limit int,
+) ([]types.Neo4jGraphNode, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	label := n.kbLabel(kbID)
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		cypher := `
+			MATCH (n:` + label + `)
+			WHERE n.name CONTAINS $query
+			OPTIONAL MATCH (n)-[r]-(:` + label + `)
+			WITH n, count(DISTINCT r) AS degree
+			ORDER BY degree DESC
+			LIMIT $limit
+			RETURN n.name AS name, coalesce(n.attributes, []) AS attributes, degree, size(coalesce(n.chunks, [])) AS chunk_count
+		`
+		params := map[string]interface{}{"query": query, "limit": limit}
+
+		result, err := tx.Run(ctx, cypher, params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search nodes: %v", err)
+		}
+
+		nodes := []types.Neo4jGraphNode{}
+		for result.Next(ctx) {
+			record := result.Record()
+			name, _ := record.Get("name")
+			degree, _ := record.Get("degree")
+			chunkCount, _ := record.Get("chunk_count")
+			attrs, _ := record.Get("attributes")
+
+			node := types.Neo4jGraphNode{
+				Name:       fmt.Sprintf("%v", name),
+				Attributes: safeStringList(map[string]interface{}{"a": attrs}, "a"),
+				Degree:     int(degree.(int64)),
+				ChunkCount: int(chunkCount.(int64)),
+			}
+			nodes = append(nodes, node)
+		}
+		return nodes, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "search nodes failed: %v", err)
+		return nil, err
+	}
+	return result.([]types.Neo4jGraphNode), nil
+}
+
+// GetGraphStats 获取图谱统计信息
+func (n *Neo4jRepository) GetGraphStats(
+	ctx context.Context,
+	kbID string,
+) (*types.Neo4jGraphStats, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	label := n.kbLabel(kbID)
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		stats := &types.Neo4jGraphStats{}
+
+		// Node count
+		r1, err := tx.Run(ctx, `MATCH (n:`+label+`) RETURN count(n) AS cnt`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count nodes: %v", err)
+		}
+		if r1.Next(ctx) {
+			if cnt, ok := r1.Record().Get("cnt"); ok {
+				stats.NodeCount = int(cnt.(int64))
+			}
+		}
+
+		// Rel count
+		r2, err := tx.Run(ctx, `MATCH (n:`+label+`)-[r]->(m:`+label+`) RETURN count(r) AS cnt`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count rels: %v", err)
+		}
+		if r2.Next(ctx) {
+			if cnt, ok := r2.Record().Get("cnt"); ok {
+				stats.RelCount = int(cnt.(int64))
+			}
+		}
+
+		// Relation types
+		r3, err := tx.Run(ctx, `
+			MATCH (n:`+label+`)-[r]->(m:`+label+`)
+			RETURN DISTINCT type(r) AS rel_type
+			ORDER BY rel_type
+		`, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get relation types: %v", err)
+		}
+		relTypes := []string{}
+		for r3.Next(ctx) {
+			if rt, ok := r3.Record().Get("rel_type"); ok {
+				relTypes = append(relTypes, fmt.Sprintf("%v", rt))
+			}
+		}
+		stats.RelTypes = relTypes
+
+		return stats, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "get graph stats failed: %v", err)
+		return nil, err
+	}
+	return result.(*types.Neo4jGraphStats), nil
+}
+
+// GetRelationTypes 获取所有关系类型
+func (n *Neo4jRepository) GetRelationTypes(
+	ctx context.Context,
+	kbID string,
+) ([]string, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	stats, err := n.GetGraphStats(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	return stats.RelTypes, nil
+}
+
+// GetNodeDetail 获取单个节点详情
+func (n *Neo4jRepository) GetNodeDetail(
+	ctx context.Context,
+	kbID string,
+	nodeName string,
+) (*types.Neo4jNodeDetail, error) {
+	if n.driver == nil {
+		return nil, fmt.Errorf("neo4j not enabled")
+	}
+	label := n.kbLabel(kbID)
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		detail := &types.Neo4jNodeDetail{
+			RelTypes:     make(map[string]int),
+			TopNeighbors: []types.Neo4jGraphNode{},
+		}
+
+		// Basic info + degree + neighbor_count
+		r1, err := tx.Run(ctx, `
+			MATCH (n:`+label+`{name: $name})
+			OPTIONAL MATCH (n)-[r]-(:`+label+`)
+			WITH n, count(DISTINCT r) AS degree
+			OPTIONAL MATCH (n)-[r2]-(m:`+label+`)
+			WITH n, degree, count(DISTINCT m) AS neighbor_count
+			RETURN n, degree, neighbor_count
+		`, map[string]interface{}{"name": nodeName})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get node detail: %v", err)
+		}
+		if !r1.Next(ctx) {
+			return nil, fmt.Errorf("node not found: %s", nodeName)
+		}
+		rec1 := r1.Record()
+		if node, ok := rec1.Get("n"); ok {
+			if n, ok := node.(neo4j.Node); ok {
+				detail.Name = fmt.Sprintf("%v", n.Props["name"])
+				detail.Attributes = safeStringList(n.Props, "attributes")
+				detail.ChunkCount = len(safeStringList(n.Props, "chunks"))
+			}
+		}
+		if deg, ok := rec1.Get("degree"); ok {
+			detail.Degree = int(deg.(int64))
+		}
+		if nc, ok := rec1.Get("neighbor_count"); ok {
+			detail.NeighborCount = int(nc.(int64))
+		}
+
+		// Relation types distribution
+		r2, err := tx.Run(ctx, `
+			MATCH (n:`+label+`{name: $name})-[r]-(:`+label+`)
+			RETURN type(r) AS rel_type, count(*) AS cnt
+		`, map[string]interface{}{"name": nodeName})
+		if err == nil {
+			for r2.Next(ctx) {
+				rec := r2.Record()
+				rt, _ := rec.Get("rel_type")
+				cnt, _ := rec.Get("cnt")
+				detail.RelTypes[fmt.Sprintf("%v", rt)] = int(cnt.(int64))
+			}
+		}
+
+		// Top 20 neighbors by degree
+		r3, err := tx.Run(ctx, `
+			MATCH (n:`+label+`{name: $name})--(m:`+label+`)
+			OPTIONAL MATCH (m)-[r2]-(:`+label+`)
+			WITH m, count(DISTINCT r2) AS m_degree
+			ORDER BY m_degree DESC
+			LIMIT 20
+			RETURN m.name AS name, coalesce(m.attributes, []) AS attributes, m_degree AS degree, size(coalesce(m.chunks, [])) AS chunk_count
+		`, map[string]interface{}{"name": nodeName})
+		if err == nil {
+			for r3.Next(ctx) {
+				rec := r3.Record()
+				name, _ := rec.Get("name")
+				degree, _ := rec.Get("degree")
+				chunkCount, _ := rec.Get("chunk_count")
+				detail.TopNeighbors = append(detail.TopNeighbors, types.Neo4jGraphNode{
+					Name:       fmt.Sprintf("%v", name),
+					Attributes: []string{},
+					Degree:     int(degree.(int64)),
+					ChunkCount: int(chunkCount.(int64)),
+				})
+			}
+		}
+
+		return detail, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "get node detail failed: %v", err)
+		return nil, err
+	}
+	return result.(*types.Neo4jNodeDetail), nil
+}

@@ -1,0 +1,59 @@
+# ============================================================================
+# MCP 侧车 compose 片段（阶段 0 仅供审阅，暂不并入主 docker-compose.yml）
+# ----------------------------------------------------------------------------
+# 合并方式（阶段 4 部署、经用户确认后执行其一）：
+#   1. 把下面 services.mcp-sidecar 整段手工并入主 docker-compose.yml；
+#      或
+#   2. 用 compose 多文件叠加：docker compose -f docker-compose.yml \
+#        -f mcp-sidecar/deploy/compose.fragment.yml ...
+#
+# 需要在 .env 追加的变量（不自动改 .env）：
+#   MCP_SIDECAR_PORT=8084
+#   WEKNORA_API_KEY=<仅 retrieve 能力的只读 API Key>
+#   SIDECAR_DB_DSN=postgresql://mcp_sidecar_ro:<密码>@postgres:5432/WeKnora
+#   REDIS_ADDR=redis:6379
+#   REDIS_PASSWORD=<同现有 Redis 密码，没有则留空>
+#   REDIS_DB=<选一个未占用的 db 号>
+#   SIDECAR_JWT_SECRET=<与千机网关签发用户票据一致的密钥；勿与主服务 JWT_SECRET 撞名>
+#   SIDECAR_SESSION_SECRET=<新生成的随机密钥，ask 多轮票据用>
+# ============================================================================
+
+services:
+  mcp-sidecar:
+    build:
+      context: ./mcp-sidecar
+    container_name: WeKnora-mcp-sidecar
+    ports:
+      # 宿主 8084 -> 容器 8000（避开 Go 主服务 8080 与旧 Python 服务 8082）
+      - "${MCP_SIDECAR_PORT:-8084}:8000"
+    environment:
+      - SIDECAR_HOST=0.0.0.0
+      - SIDECAR_PORT=8000
+      # 调试版后端在宿主机跑（make dev-fqx），容器内通过 host.docker.internal 访问
+      - WEKNORA_BASE_URL=http://host.docker.internal:8083/api/v1
+      - WEKNORA_API_KEY=${WEKNORA_API_KEY:-}
+      - WEKNORA_VERIFY_SSL=true
+      - SIDECAR_DB_DSN=${SIDECAR_DB_DSN:-}
+      - REDIS_ADDR=${REDIS_ADDR:-redis:6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=${REDIS_DB:-}
+      - JWT_SECRET=${SIDECAR_JWT_SECRET:-}
+      - SIDECAR_SESSION_SECRET=${SIDECAR_SESSION_SECRET:-}
+      - ASK_TIMEOUT=240
+    # 2026-11-03 起模式改为凭证自识别，不再挂载 identity.yaml 名单
+    # dev 模式下后端在宿主机跑，app 容器没起，不需要 depends_on
+    networks:
+      - weknora-dev
+    # Linux docker 默认不解析 host.docker.internal，显式指向宿主机网关
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    profiles:
+      - full
+
+# 加入 dev 调试栈已存在的网络（项目名 weknora-dev 启动的那套）
+# 侧车本身不依赖 WeKnora-app 容器，但要在这个网络里才能用服务名 redis 访问 dev Redis
+networks:
+  weknora-dev:
+    external: true
+    name: weknora-dev_WeKnora-network-dev
